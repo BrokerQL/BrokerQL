@@ -1,0 +1,3 @@
+ib-insync==0.9.86
+mycli==1.27.0
+mysql-mimic==2.5.1
