@@ -4,7 +4,7 @@ import asyncio
 import inspect
 from collections import defaultdict
 from io import UnsupportedOperation
-from typing import Dict, List, Callable, Any, Awaitable
+from typing import Dict, List, Callable, Any, Awaitable, Optional
 
 from mysql_mimic import Session as _Session, AllowedResult, ResultSet
 from mysql_mimic.errors import MysqlError, ErrorCode
@@ -22,7 +22,8 @@ def is_coroutine_function(func: Any):
 
 class Session(_Session):
     SCHEMA_PROVIDERS: List[Callable[[], Dict[str, Dict[str, List[Column]]]]] = []
-    DATA_PROVIDERS: Dict[str, Callable[[str], Awaitable[List[Dict[str, Any]]] | List[Dict[str, Any]]]] = {}
+    DATA_PROVIDERS: Dict[
+        str, Callable[[str, Optional[List[Dict]]], Awaitable[List[Dict[str, Any]]] | List[Dict[str, Any]]]] = {}
     DATA_CREATORS: Dict[str, Callable[[Session, str, list, list], Awaitable | None]] = {}
     DATA_MODIFIERS: Dict[str, Callable[[Session, str, list, dict], Awaitable[int] | int]] = {}
     DATA_REMOVERS: Dict[str, Callable[[Session, str, list], Awaitable | None]] = {}
@@ -56,7 +57,14 @@ class Session(_Session):
                 supplier = self.DATA_PROVIDERS.get(db)
                 if supplier is None:
                     raise MysqlError(f"Unknown database '{db}'", code=ErrorCode.NO_DB_ERROR)
-                rows = supplier(table.name)
+                rows, columns = [], []
+                if table.name == 'ohlcv':
+                    query = f"select symbol from subscriptions {expression.args.get('where', '')}"
+                    query_expression = self._parse(query)[0]
+                    rows, columns = await self.query(query_expression, query, attrs)
+
+                rows = supplier(table.name, [{k: v for k, v in zip(columns, row)} for row in
+                                             rows] if 'where' in expression.args else None)
                 if inspect.isawaitable(rows):
                     rows = await rows
                 if rows is None:

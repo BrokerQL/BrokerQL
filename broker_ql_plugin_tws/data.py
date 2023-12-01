@@ -4,11 +4,13 @@ import configparser
 import dataclasses
 import functools
 from io import UnsupportedOperation
+from typing import Optional, Dict, List
 
 import ib_insync.ib as _ib
 from ib_insync import IB
-from broker_ql import reloading
+from mysql_mimic.errors import MysqlError, ErrorCode
 
+from broker_ql import reloading
 from broker_ql.session import Session
 from .wrapper import Wrapper
 
@@ -17,6 +19,7 @@ _ib.Wrapper = Wrapper
 ib = IB()
 
 __plugin_name__ = "plugin_tws"
+__database_name__ = "tws"
 
 _config_parse = configparser.ConfigParser()
 _config_parse.add_section(__plugin_name__)
@@ -52,7 +55,7 @@ def camel_case(s: str):
 @reloading
 def schema_provider():
     return {
-        "tws": {
+        __database_name__: {
             "orders": {
                 "order_id": "INT",
                 "account": "VARCHAR",
@@ -90,40 +93,75 @@ def schema_provider():
                 "last": "DOUBLE",
                 "close": "DOUBLE",
             },
+            "ohlcv": {
+                "date": "TIMESTAMP",
+                "symbol": "VARCHAR",
+                "open": "DOUBLE",
+                "high": "DOUBLE",
+                "low": "DOUBLE",
+                "close": "DOUBLE",
+                "volume": "DOUBLE",
+            },
         }
     }
 
 
 @reloading
-def select(table_name):
+async def select(table_name: str, where: Optional[List[Dict]] = None):
+    schema = schema_provider()[__database_name__]
+    if table_name not in schema:
+        return None
+    columns = schema[table_name]
     if table_name == 'orders':
-        return mapping([t for t in ib.openTrades() if t.isActive()], schema_provider()['tws'][table_name], 'order', {
+        return mapping([t for t in ib.openTrades() if t.isActive()], columns, 'order', {
             'symbol': 'contract',
             'status': 'orderStatus',
         })
     elif table_name == 'positions':
-        return mapping([p for p in ib.positions() if p.avgCost != 0], schema_provider()['tws'][table_name], 'self', {
+        return mapping([p for p in ib.positions() if p.avgCost != 0], columns, 'self', {
             'symbol': 'contract',
         })
     elif table_name == 'subscriptions':
-        return mapping([t for t in ib.tickers()], schema_provider()['tws'][table_name], 'contract', {
+        return mapping([t for t in ib.tickers()], columns, 'contract', {
         })
     elif table_name == 'quotes':
-        return mapping([t for t in ib.tickers()], schema_provider()['tws'][table_name], 'self', {
+        return mapping([t for t in ib.tickers()], columns, 'self', {
             'symbol': 'contract',
         })
+    elif table_name == 'ohlcv':
+        results = []
+        if where is not None:
+            symbols = [r['symbol'] for r in where]
+        else:
+            symbols = None
+        for t in ib.tickers():
+            if symbols is not None and t.contract.symbol not in symbols:
+                continue
+            bars = await ib.reqHistoricalDataAsync(
+                t.contract, '', '50 D', '1 day', 'TRADES', True, formatDate=1,
+                timeout=0)
+            result = mapping(bars, columns, 'self', {}, consts={
+                'symbol': bars.contract.symbol
+            })
+            results += result
+        return results
     else:
         return []
 
 
 @reloading
-def mapping(objects: list, cols: list[str], obj_attr, specials: dict):
+def mapping(objects: list, cols: list[str], obj_attr, specials: dict, consts: dict = None):
+    if consts is None:
+        consts = {}
     rows = []
     for ele in objects:
         row = {}
         for col in cols:
             attr = camel_case(col)
             obj = getattr(ele, obj_attr) if obj_attr != 'self' else ele
+            if attr in consts:
+                row[col] = consts[attr]
+                continue
             if attr in specials:
                 obj = getattr(ele, specials[attr])
             row[col] = getattr(obj, attr)
@@ -132,10 +170,17 @@ def mapping(objects: list, cols: list[str], obj_attr, specials: dict):
 
 
 @reloading
-async def insert(session: Session, table_name: str, fields: list[str], rows: list) -> int:
+async def insert(session: Session, table_name: str, fields: List[str], rows: List) -> int:
     if table_name not in {'subscriptions'}:
         raise UnsupportedOperation()
     affected_rows = 0
+    schema = schema_provider()[__database_name__]
+    if table_name not in schema:
+        return 0
+    columns = schema[table_name]
+    for col in fields:
+        if col not in columns:
+            raise MysqlError(f"Unknown column '{table_name}.{col}'", code=ErrorCode.NO_DB_ERROR)
     if table_name == 'subscriptions':
         if 'symbol' not in fields:
             return 0
@@ -154,7 +199,7 @@ async def insert(session: Session, table_name: str, fields: list[str], rows: lis
 
 
 @reloading
-async def update(session: Session, table_name: str, rows: list, fields: dict):
+async def update(session: Session, table_name: str, rows: List, fields: Dict):
     if table_name not in {'orders'}:
         raise UnsupportedOperation()
     if table_name == 'orders':
@@ -177,7 +222,7 @@ async def update(session: Session, table_name: str, rows: list, fields: dict):
 
 
 @reloading
-async def delete(session: Session, table_name: str, rows: list):
+async def delete(session: Session, table_name: str, rows: List):
     if table_name not in {'orders', 'subscriptions'}:
         raise UnsupportedOperation()
     if table_name == 'orders':

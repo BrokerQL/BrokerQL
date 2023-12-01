@@ -50,7 +50,7 @@ pip install BrokerQL
 macOS only
 
 ```sh
-brew tap BrokeQL/tap
+brew tap BrokerQL/tap
 brew install broker-ql
 ```
 
