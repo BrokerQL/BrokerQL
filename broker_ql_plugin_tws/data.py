@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import configparser
 import dataclasses
 import functools
+import inspect
+import traceback
 from io import UnsupportedOperation
 from typing import Optional, Dict, List
 
 import ib_insync.ib as _ib
 from ib_insync import IB
 from mysql_mimic.errors import MysqlError, ErrorCode
+from sqlglot.executor.env import ENV as _ENV
 
 from broker_ql import reloading
 from broker_ql.session import Session
@@ -18,6 +22,28 @@ _ib.Wrapper = Wrapper
 
 ib = IB()
 
+_FUTURES: Dict[int | str, asyncio.Future] = {}
+
+
+def _on_error(req_id, err_code, err_string, contract):
+    try:
+        future = _FUTURES.pop(req_id)
+        future.set_exception(Exception(err_string))
+    except KeyError:
+        pass
+
+
+def _on_order_open(trade: _ib.Trade):
+    try:
+        future = _FUTURES.pop(trade.order.orderId)
+        future.set_result(None)
+    except KeyError:
+        pass
+
+
+ib.errorEvent += _on_error
+ib.openOrderEvent += _on_order_open
+
 __plugin_name__ = "plugin_tws"
 __database_name__ = "tws"
 
@@ -25,6 +51,13 @@ _config_parse = configparser.ConfigParser()
 _config_parse.add_section(__plugin_name__)
 
 config: configparser.SectionProxy = _config_parse[__plugin_name__]
+
+
+def next_order_id():
+    return ib.client.getReqId()
+
+
+_ENV['TWS_NEXT_ORDER_ID'] = next_order_id
 
 
 async def init():
@@ -69,6 +102,7 @@ def schema_provider():
                 "order_ref": "VARCHAR",
                 "parent_id": "INT",
                 "oca_group": "VARCHAR",
+                "transmit": "BOOLEAN",
                 "status": "VARCHAR",
             },
             "positions": {
@@ -171,7 +205,7 @@ def mapping(objects: list, cols: list[str], obj_attr, specials: dict, consts: di
 
 @reloading
 async def insert(session: Session, table_name: str, fields: List[str], rows: List) -> int:
-    if table_name not in {'subscriptions'}:
+    if table_name not in {'subscriptions', 'orders'}:
         raise UnsupportedOperation()
     affected_rows = 0
     schema = schema_provider()[__database_name__]
@@ -181,6 +215,9 @@ async def insert(session: Session, table_name: str, fields: List[str], rows: Lis
     for col in fields:
         if col not in columns:
             raise MysqlError(f"Unknown column '{table_name}.{col}'", code=ErrorCode.NO_DB_ERROR)
+    for i, row in enumerate(rows):
+        if len(row) != len(fields):
+            raise MysqlError(f"Column count doesn't match value count at row {i + 1}'", code=ErrorCode.PARSE_ERROR)
     if table_name == 'subscriptions':
         if 'symbol' not in fields:
             return 0
@@ -194,6 +231,41 @@ async def insert(session: Session, table_name: str, fields: List[str], rows: Lis
             if ib.ticker(contract) is not None:
                 continue
             ib.reqMktData(contract)
+            affected_rows += 1
+    elif table_name == 'orders':
+        if 'symbol' not in fields:
+            return 0
+        for idx, row in enumerate(rows):
+            row = {camel_case(k): v for k, v in zip(fields, row)}
+            for t in ib.tickers():
+                if t.contract.symbol != row['symbol']:
+                    continue
+                contract = t.contract
+                break
+            else:
+                contract = _ib.Contract(symbol=row['symbol'], exchange="SMART", currency="USD", secType="STK")
+                qualified = await ib.qualifyContractsAsync(contract)
+                if not qualified:
+                    continue
+                contract = qualified[0]
+            params = inspect.signature(_ib.Order).parameters
+            order = dataclasses.replace(_ib.Order(), **{k: v for k, v in row.items() if k in params})
+            commit, rollback = None, None
+            if session.in_trx:
+                last_row = idx == len(rows) - 1
+                order.transmit = False
+                commit = functools.partial(ib.placeOrder, contract, dataclasses.replace(order, transmit=last_row))
+                rollback = functools.partial(ib.cancelOrder, dataclasses.replace(order))
+            try:
+                future = asyncio.Future()
+                _FUTURES[order.orderId] = future
+                ib.placeOrder(contract, order)
+                await future
+                if session.in_trx:
+                    session.trx_commits.append(commit)
+                    session.trx_rollbacks.append(rollback)
+            except Exception as e:
+                raise MysqlError(str(e) or traceback.format_exc(), code=ErrorCode.UNKNOWN_ERROR)
             affected_rows += 1
     return affected_rows
 
@@ -211,14 +283,23 @@ async def update(session: Session, table_name: str, rows: List, fields: Dict):
                 if k in {'order_id'}:
                     continue
                 setattr(order, camel_case(k), order_rows[trade.order.orderId][k])
+            commit, rollback = None, None
             if session.in_trx:
                 order.transmit = False
                 commit = functools.partial(ib.placeOrder, trade.contract, dataclasses.replace(order, transmit=True))
-                session.trx_commits.append(commit)
                 rollback = functools.partial(ib.placeOrder, trade.contract,
                                              dataclasses.replace(trade.order, parentId=0))
-                session.trx_rollbacks.append(rollback)
-            ib.placeOrder(trade.contract, order)
+            try:
+                future = asyncio.Future()
+                _FUTURES[order.orderId] = future
+                ib.placeOrder(trade.contract, order)
+                await asyncio.wait_for(future, 0.2)
+            except asyncio.TimeoutError:
+                if session.in_trx:
+                    session.trx_commits.append(commit)
+                    session.trx_rollbacks.append(rollback)
+            except Exception as e:
+                raise MysqlError(str(e) or traceback.format_exc(), code=ErrorCode.UNKNOWN_ERROR)
 
 
 @reloading

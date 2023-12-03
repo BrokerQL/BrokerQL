@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 from collections import defaultdict
 from io import UnsupportedOperation
@@ -9,15 +8,11 @@ from typing import Dict, List, Callable, Any, Awaitable, Optional
 from mysql_mimic import Session as _Session, AllowedResult, ResultSet
 from mysql_mimic.errors import MysqlError, ErrorCode
 from mysql_mimic.schema import BaseInfoSchema, Column
-from mysql_mimic.session import Query
+from mysql_mimic.session import Query, expression_to_value, value_to_expression, setitem_kind
 from sqlglot import expressions as exp
 from sqlglot.executor import execute
 
 from .util import reloading
-
-
-def is_coroutine_function(func: Any):
-    return asyncio.iscoroutinefunction(func) or (hasattr(func, "func") and asyncio.iscoroutinefunction(func.func))
 
 
 class Session(_Session):
@@ -33,6 +28,7 @@ class Session(_Session):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.user_variables = {}
         self.in_trx = False
         self.trx_commits = []
         self.trx_rollbacks = []
@@ -75,6 +71,8 @@ class Session(_Session):
         elif expression.key == 'insert':
             if expression.this.key == 'table':
                 table = expression.this
+                db = self.database if table.db == '' and self.database is not None else table.db
+                fields = [col for col in self.SCHEMA[db][table.name]]
             else:
                 schema = expression.this
                 table = schema.this
@@ -82,7 +80,17 @@ class Session(_Session):
             values = []
             if expression.expression.key == 'values':
                 for row in expression.expression.expressions:
-                    values.append([v.this if v.is_string else int(v.this) if v.is_int else float(v.this) for v in row])
+                    value = []
+                    for v in row:
+                        if isinstance(v, exp.Literal):
+                            value.append(v.this if v.is_string else int(v.this) if v.is_int else float(v.this))
+                        else:
+                            query = f"select {v} limit 1"
+                            result = execute(query)
+                            for rt_row in result.rows:
+                                value.append(rt_row[0])
+                    values.append(value)
+
             db = self.database if table.db == '' and self.database is not None else table.db
             creator = self.DATA_CREATORS.get(db)
             try:
@@ -104,7 +112,7 @@ class Session(_Session):
             fields = {expr.left.sql(): expr.right.sql() for expr in expression.expressions}
             alias.update(fields)
             projects = [f"{v} as {k}" for k, v in alias.items()]
-            query = f"select {', '.join(projects)} from {table.name} {expression.args['where']}"
+            query = f"select {', '.join(projects)} from {table.name} {expression.args.get('where', '')}"
             query_expression = self._parse(query)[0]
             rows, columns = await self.query(query_expression, query, attrs)
             if not rows:
@@ -184,3 +192,100 @@ class Session(_Session):
         for provider in self.SCHEMA_PROVIDERS:
             self.SCHEMA.update(provider())
         return self.SCHEMA
+
+    async def _set_variable(self, setitem: exp.SetItem) -> None:
+        try:
+            super()._set_variable(setitem)
+        except MysqlError as e:
+            if e.code != ErrorCode.NOT_SUPPORTED_YET:
+                raise e
+            assignment = setitem.this
+            left = assignment.left
+            name = left.name
+            right = assignment.right
+            value = expression_to_value(right)
+            if value == right.name and not isinstance(right, exp.Literal):
+                if right.key in ['subquery']:
+                    query = right.this.sql()
+                elif right.key in ['select']:
+                    query = right.sql()
+                else:
+                    query = f"select {right} as value"
+                rows, col = await self.handle_query(query, {})
+                for row in rows:
+                    self.user_variables[name] = row[0]
+                    break
+            else:
+                self.user_variables[name] = value
+
+    async def _replace_variables_middleware(self, q: Query) -> AllowedResult:
+        def _transform(node: exp.Expression) -> exp.Expression:
+            new_node = None
+
+            if isinstance(node, exp.Func):
+                if isinstance(node, exp.Anonymous):
+                    func_name = node.name.upper()
+                else:
+                    func_name = node.sql_name()
+                func = self._functions.get(func_name)
+                if func:
+                    value = func()
+                    new_node = value_to_expression(value)
+            elif isinstance(node, exp.Column) and node.sql() in self._constants:
+                value = self._functions[node.sql()]()
+                new_node = value_to_expression(value)
+            elif isinstance(node, exp.SessionParameter):
+                value = self.variables.get(node.name)
+                new_node = value_to_expression(value)
+            elif isinstance(node, exp.Parameter):
+                value = self.user_variables.get(node.name)
+                new_node = value_to_expression(value)
+
+            if (
+                    new_node
+                    and isinstance(node.parent, exp.Select)
+                    and node.arg_key == "expressions"
+            ):
+                new_node = exp.alias_(new_node, exp.to_identifier(node.sql()))
+
+            return new_node or node
+
+        if isinstance(q.expression, exp.Set):
+            for setitem in q.expression.expressions:
+                if isinstance(setitem.this, exp.Binary):
+                    # In the case of statements like: SET @@foo = @@bar
+                    # We only want to replace variables on the right
+                    setitem.this.set(
+                        "expression",
+                        setitem.this.expression.transform(_transform, copy=True),
+                    )
+        else:
+            q.expression.transform(_transform, copy=False)
+
+        return await q.next()
+
+    async def _set_middleware(self, q: Query) -> AllowedResult:
+        """Intercept SET statements"""
+        if isinstance(q.expression, exp.Set):
+            expressions = q.expression.expressions
+            for item in expressions:
+                assert isinstance(item, exp.SetItem)
+
+                kind = setitem_kind(item)
+
+                if kind == "VARIABLE":
+                    await self._set_variable(item)
+                elif kind == "CHARACTER SET":
+                    self._set_charset(item)
+                elif kind == "NAMES":
+                    self._set_names(item)
+                elif kind == "TRANSACTION":
+                    self._set_transaction(item)
+                else:
+                    raise MysqlError(
+                        f"Unsupported SET statement: {kind}",
+                        code=ErrorCode.NOT_SUPPORTED_YET,
+                    )
+
+            return [], []
+        return await q.next()

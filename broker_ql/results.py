@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import itertools
 from typing import Sequence, AsyncIterable, Any, cast
 
 from mysql_mimic import ColumnType
 from mysql_mimic.results import AllowedColumn, ResultSet, ResultColumn, infer_type
 from mysql_mimic.utils import aiterate
+from sqlglot.optimizer import Scope
+from sqlglot import alias, exp
 
 
 async def _ensure_result_cols(
@@ -70,3 +73,26 @@ async def _ensure_result_cols(
 
     assert all(isinstance(col, ResultColumn) for col in columns)
     return ResultSet(rows=gen_rows(), columns=cast(Sequence[ResultColumn], columns))
+
+
+def _qualify_outputs(scope: Scope) -> None:
+    """Ensure all output columns are aliased"""
+    new_selections = []
+
+    for i, (selection, aliased_column) in enumerate(
+            itertools.zip_longest(scope.expression.selects, scope.outer_column_list)
+    ):
+        if isinstance(selection, exp.Subquery):
+            if not selection.output_name:
+                selection.set("alias", exp.TableAlias(this=exp.to_identifier(f"_col_{i}")))
+        elif not isinstance(selection, exp.Alias) and not selection.is_star:
+            selection = alias(
+                selection,
+                alias=selection.output_name or selection.sql(),
+            )
+        if aliased_column:
+            selection.set("alias", exp.to_identifier(aliased_column))
+
+        new_selections.append(selection)
+
+    scope.expression.set("expressions", new_selections)

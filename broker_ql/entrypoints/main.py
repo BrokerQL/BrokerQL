@@ -106,7 +106,13 @@ def main():
             return config.read_config_file(default_config_file, list_values=list_values)
 
         def write_default_config(destination, overwrite=False):
-            pass
+            default_config = resources.read_text('broker_ql', 'myclirc_nt' if os.name == 'nt' else 'myclirc')
+            destination = os.path.expanduser(destination)
+            if not overwrite and os.path.exists(destination):
+                return
+
+            with open(destination, 'w') as f:
+                f.write(default_config)
 
         config.create_default_config = create_default_config
         mycli.main.write_default_config = write_default_config
