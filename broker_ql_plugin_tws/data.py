@@ -136,6 +136,11 @@ def schema_provider():
                 "close": "DOUBLE",
                 "volume": "DOUBLE",
             },
+            "accounts": {
+                "account": "VARCHAR",
+                "net_liquidation": "DOUBLE",
+                "total_cash_value": "DOUBLE",
+            },
         }
     }
 
@@ -162,6 +167,21 @@ async def select(table_name: str, where: Optional[List[Dict]] = None):
         return mapping([t for t in ib.tickers()], columns, 'self', {
             'symbol': 'contract',
         })
+    elif table_name == 'accounts':
+        rows = []
+        for account in ib.managedAccounts():
+            account_info = {f"{tag.tag[0].lower()}{tag.tag[1:]}": tag.value for tag in
+                            await ib.accountSummaryAsync(account) if
+                            tag.currency in ['USD', '']}
+            account_info['account'] = account
+            row = {}
+            for col, d_type in columns.items():
+                value = account_info[camel_case(col)]
+                if d_type == 'DOUBLE':
+                    value = float(value)
+                row[col] = value
+            rows.append(row)
+        return rows
     elif table_name == 'ohlcv':
         results = []
         if where is not None:

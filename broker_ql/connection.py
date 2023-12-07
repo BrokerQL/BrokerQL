@@ -15,6 +15,20 @@ import sqlglot.optimizer.qualify_columns as qualify_columns
 
 qualify_columns._qualify_outputs = _qualify_outputs
 
+from sqlglot.executor import optimize as _optimize
+
+import sqlglot.executor as _executor
+import sqlglot.optimizer as _optimizer
+
+
+def optimize(*args, **kwargs):
+    if 'rules' not in kwargs:
+        kwargs['rules'] = _optimizer.RULES[:-1]
+    return _optimize(*args, **kwargs)
+
+
+_executor.optimize = optimize
+
 
 class Connection(_Connection):
 
