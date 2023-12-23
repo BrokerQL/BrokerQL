@@ -6,6 +6,7 @@ import dataclasses
 import functools
 import inspect
 import traceback
+from asyncio import InvalidStateError
 from io import UnsupportedOperation
 from typing import Optional, Dict, List
 
@@ -16,7 +17,7 @@ from sqlglot.executor.env import ENV as _ENV
 
 from broker_ql import reloading
 from broker_ql.session import Session
-from .wrapper import Wrapper
+from .wrapper import Wrapper, UNSET_DOUBLE
 
 _ib.Wrapper = Wrapper
 
@@ -31,6 +32,8 @@ def _on_error(req_id, err_code, err_string, contract):
         future.set_exception(Exception(err_string))
     except KeyError:
         pass
+    except InvalidStateError:
+        pass
 
 
 def _on_order_open(trade: _ib.Trade):
@@ -38,6 +41,8 @@ def _on_order_open(trade: _ib.Trade):
         future = _FUTURES.pop(trade.order.orderId)
         future.set_result(None)
     except KeyError:
+        pass
+    except InvalidStateError:
         pass
 
 
@@ -99,6 +104,8 @@ def schema_provider():
                 "tif": "VARCHAR",
                 "aux_price": "DOUBLE",
                 "lmt_price": "DOUBLE",
+                "trailing_percent": "DOUBLE",
+                "trail_stop_price": "DOUBLE",
                 "order_ref": "VARCHAR",
                 "parent_id": "INT",
                 "oca_group": "VARCHAR",
@@ -218,7 +225,10 @@ def mapping(objects: list, cols: list[str], obj_attr, specials: dict, consts: di
                 continue
             if attr in specials:
                 obj = getattr(ele, specials[attr])
-            row[col] = getattr(obj, attr)
+            value = getattr(obj, attr)
+            if isinstance(value, float) and value == UNSET_DOUBLE:
+                value = float('nan')
+            row[col] = value
         rows.append(row)
     return rows
 
@@ -278,9 +288,14 @@ async def insert(session: Session, table_name: str, fields: List[str], rows: Lis
                 rollback = functools.partial(ib.cancelOrder, dataclasses.replace(order))
             try:
                 future = asyncio.Future()
-                _FUTURES[order.orderId] = future
+                if order.transmit:
+                    _FUTURES[order.orderId] = future
                 ib.placeOrder(contract, order)
-                await future
+                if order.transmit:
+                    try:
+                        await asyncio.wait_for(future, 0.2)
+                    except asyncio.TimeoutError:
+                        pass
                 if session.in_trx:
                     session.trx_commits.append(commit)
                     session.trx_rollbacks.append(rollback)

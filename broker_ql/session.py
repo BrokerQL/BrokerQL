@@ -45,6 +45,8 @@ class Session(_Session):
 
     @reloading
     async def query(self, expression, sql: str, attrs) -> AllowedResult:
+        if not self.SCHEMA:
+            await self.schema()
         if expression.key == 'select':
             tables = []
             self.extract_tables(tables, expression)

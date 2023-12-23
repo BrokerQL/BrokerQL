@@ -34,8 +34,12 @@ class BrokerQLServer(MysqlServer):
                 continue
             try:
                 plugin = import_module(f"broker_ql_plugin_{plugin_name}")
-                plugin_cnf = self.config[f'plugin_{plugin_name}']
                 if hasattr(plugin, 'plugin_config'):
+                    plugin_config_section = f'plugin_{plugin_name}'
+                    if not self.config.has_section(plugin_config_section):
+                        print(f"missing section {plugin_config_section} in config, skip loading plugin {plugin_name}")
+                        continue
+                    plugin_cnf = self.config[plugin_config_section]
                     plugin.plugin_config.update(plugin_cnf)
                 if hasattr(plugin, 'init'):
                     if asyncio.iscoroutinefunction(plugin.init):
