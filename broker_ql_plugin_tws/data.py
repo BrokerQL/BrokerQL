@@ -111,6 +111,7 @@ def schema_provider():
                 "oca_group": "VARCHAR",
                 "transmit": "BOOLEAN",
                 "status": "VARCHAR",
+                "why_held": "VARCHAR",
             },
             "positions": {
                 "account": "VARCHAR",
@@ -162,6 +163,7 @@ async def select(table_name: str, where: Optional[List[Dict]] = None):
         return mapping([t for t in ib.openTrades() if t.isActive()], columns, 'order', {
             'symbol': 'contract',
             'status': 'orderStatus',
+            'whyHeld': 'orderStatus',
         })
     elif table_name == 'positions':
         return mapping([p for p in ib.positions() if p.avgCost != 0], columns, 'self', {
