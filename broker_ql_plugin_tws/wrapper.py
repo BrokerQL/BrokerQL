@@ -1,5 +1,5 @@
-from ib_insync import Wrapper as _Wrapper, Contract, Order, OrderState, OrderStatus, Trade
-from ib_insync.util import UNSET_DOUBLE, dataclassAsDict
+from ib_async import Wrapper as _Wrapper, Contract, Order, OrderState, OrderStatus, Trade
+from ib_async.util import UNSET_DOUBLE, dataclassAsDict
 
 
 class Wrapper(_Wrapper):

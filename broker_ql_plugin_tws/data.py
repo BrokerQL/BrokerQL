@@ -10,8 +10,8 @@ from asyncio import InvalidStateError
 from io import UnsupportedOperation
 from typing import Optional, Dict, List
 
-import ib_insync.ib as _ib
-from ib_insync import IB
+import ib_async.ib as _ib
+from ib_async import IB
 from mysql_mimic.errors import MysqlError, ErrorCode
 from sqlglot.executor.env import ENV as _ENV
 
