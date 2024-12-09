@@ -1,3 +1,5 @@
+import json
+
 import mysql_mimic.results as _results
 from mysql_mimic import packets
 from mysql_mimic.connection import Connection as _Connection
@@ -6,6 +8,7 @@ from sqlglot.expressions import Func, AggFunc
 from sqlglot.helper import subclasses
 from sqlglot.dialects.mysql import MySQL
 import numpy as np
+from time import sleep
 
 from .results import _ensure_result_cols, _qualify_outputs
 
@@ -94,8 +97,20 @@ class TA_Highest(OffsetAggFunc):
 
 _ENV["TA_HIGHEST"] = TA_Highest.apply
 
+
+def sql_sleep(seconds):
+    sleep(seconds)
+    return seconds
+
+def sql_json_get(content, key, default=None):
+    d = json.loads(content)
+    return d.get(key, default)
+
+
 _ENV.update({
     "ROUND": null_if_any(lambda this, e: round(this, e)),
+    "SLEEP": null_if_any(sql_sleep),
+    "JSON_GET": null_if_any(sql_json_get),
 })
 
 for f in subclasses(__name__, Func, (Func, AggFunc, OffsetAggFunc)):
